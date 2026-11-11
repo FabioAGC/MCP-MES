@@ -1,0 +1,11 @@
+{
+  "baseUrl": "https://192.168.0.121:443/mesmw",
+  "tokenUrl": "https://192.168.0.121:443/identitymanager/connect/token",
+  "host": "wt2.mes.local",
+
+  "clientId": "AIM_DefaultManagementClient",
+  "clientSecret": "QUlNX0RlZmF1bHRNYW5hZ2VtZW50Q2xpZW50Og==",
+
+  "username": "domain\\mesusername",
+  "password": "mespassword"
+}
