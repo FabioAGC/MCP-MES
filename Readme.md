@@ -52,6 +52,31 @@ Update the `config/config.json` file with your credentials and server details.
 
 Do not modify any other files.
 
+### Optional performance settings
+
+These keys can be added to `config/config.json`. All are optional.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `toolMode` | `"dynamic"` | `"dynamic"` exposes 3 small tools (`mes_search_operations`, `mes_describe_operation`, `mes_call_operation`) and Claude looks up the operation it needs. `"full"` exposes one tool per MES operation (252 tools, about 490 KB loaded into every conversation). |
+| `readOnly` | `false` | `true` keeps only GET operations. |
+| `includeTags` | all | List of Swagger tags to keep, e.g. `["V3_WO", "V3_JobExec"]`. |
+| `includeTools` | all | List of operation names to keep, e.g. `["V3_WO_Get"]`. |
+| `excludeTools` | none | List of operation names to hide. |
+| `maxResponseChars` | `200000` | Longer MES responses are cut at this size. Use `max_rows` to ask for less data. |
+| `timeoutMs` | `30000` | Timeout of each HTTP request to the MES. |
+| `maxSockets` | `10` | Maximum parallel connections kept open to the MES. |
+
+Example:
+
+```json
+{
+  "toolMode": "full",
+  "readOnly": true,
+  "includeTags": ["V3_WO", "V3_JobExec"]
+}
+```
+
 ---
 
 ## 3. Configure Claude Desktop

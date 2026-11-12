@@ -20,7 +20,7 @@ if (!fs.existsSync(configPath)) {
   throw new Error(`Missing config file: ${configPath}`);
 }
 
-const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+export const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
 
 const BASE_URL = config.baseUrl;
 const TOKEN_URL = config.tokenUrl;
@@ -40,10 +40,21 @@ const BASIC_AUTH =
   Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
 // -----------------------------------------
-// SSL (Internal Self-Signed Support)
+// HTTP CLIENT
+// One shared client with keep-alive, so the TCP + TLS handshake
+// is paid once and reused by every following call.
+// SSL validation stays off (internal self-signed support).
 // -----------------------------------------
 const httpsAgent = new https.Agent({
-  rejectUnauthorized: false
+  rejectUnauthorized: false,
+  keepAlive: true,
+  maxSockets: config.maxSockets || 10
+});
+
+const http = axios.create({
+  httpsAgent,
+  timeout: config.timeoutMs || 30000,
+  maxBodyLength: Infinity
 });
 
 // -----------------------------------------
@@ -51,61 +62,74 @@ const httpsAgent = new https.Agent({
 // -----------------------------------------
 let cachedToken = null;
 let tokenExpiry = 0;
+// Token request in flight, shared by concurrent calls
+let pendingToken = null;
+
+async function requestToken() {
+  const formData = new URLSearchParams();
+  formData.append("grant_type", "password");
+  formData.append("scope", "system");
+  formData.append("username", USERNAME);
+  formData.append("password", PASSWORD);
+
+  const response = await http.post(TOKEN_URL, formData, {
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Host: HOST,
+      Authorization: `Basic ${BASIC_AUTH}`
+    }
+  });
+
+  if (!response.data?.access_token) {
+    throw new Error("No access_token returned from MES Identity Manager.");
+  }
+
+  cachedToken = response.data.access_token;
+
+  // Fallback ~55 mins
+  const expiresInSeconds = response.data.expires_in || 3300;
+
+  // Refresh slightly early (30 sec buffer)
+  tokenExpiry = Date.now() + (expiresInSeconds - 30) * 1000;
+
+  return cachedToken;
+}
 
 // -----------------------------------------
 // GET ACCESS TOKEN
 // grant_type=password
 // -----------------------------------------
-async function getAccessToken() {
-  try {
-    // Reuse cached token if valid
-    if (cachedToken && Date.now() < tokenExpiry) {
-      return cachedToken;
-    }
+function getAccessToken() {
+  // Reuse cached token if valid
+  if (cachedToken && Date.now() < tokenExpiry) {
+    return Promise.resolve(cachedToken);
+  }
 
-    const formData = new URLSearchParams();
-    formData.append("grant_type", "password");
-    formData.append("scope", "system");
-    formData.append("username", USERNAME);
-    formData.append("password", PASSWORD);
+  // Parallel calls wait for the same token request
+  if (!pendingToken) {
+    pendingToken = requestToken()
+      .catch((error) => {
+        console.error(
+          "[MES Auth] Token request failed:",
+          error.response?.data || error.message
+        );
+        throw error;
+      })
+      .finally(() => {
+        pendingToken = null;
+      });
+  }
 
-    const response = await axios.post(
-      TOKEN_URL,
-      formData,
-      {
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/x-www-form-urlencoded",
-          Host: HOST,
-          Authorization: `Basic ${BASIC_AUTH}`
-        },
-        httpsAgent,
-        maxBodyLength: Infinity
-      }
-    );
+  return pendingToken;
+}
 
-    if (!response.data?.access_token) {
-      throw new Error("No access_token returned from MES Identity Manager.");
-    }
-
-    cachedToken = response.data.access_token;
-
-    // Fallback ~55 mins
-    const expiresInSeconds = response.data.expires_in || 3300;
-
-    // Refresh slightly early (30 sec buffer)
-    tokenExpiry = Date.now() + ((expiresInSeconds - 30) * 1000);
-
-
-    return cachedToken;
-
-  } catch (error) {
-    console.error(
-      "[MES Auth] Token request failed:",
-      error.response?.data || error.message
-    );
-
-    throw error;
+// Drop the token only if it is still the one that was rejected,
+// so parallel 401s trigger a single refresh.
+function invalidateToken(rejectedToken) {
+  if (cachedToken === rejectedToken) {
+    cachedToken = null;
+    tokenExpiry = 0;
   }
 }
 
@@ -118,15 +142,8 @@ export async function executeSwaggerTool(tool, args = {}) {
       throw new Error("Swagger tool definition is missing.");
     }
 
-    // Always ensure valid token
-    const token = await getAccessToken();
-
     const queryParams = {};
-
-    const headers = {
-      Authorization: `Bearer ${token}`
-    };
-
+    const headers = {};
     let body = null;
 
     // -----------------------------------------
@@ -136,10 +153,7 @@ export async function executeSwaggerTool(tool, args = {}) {
     // header=> args[param.name]
     // -----------------------------------------
     for (const param of tool.parameters || []) {
-      const value =
-        param.in === "body"
-          ? args.body
-          : args[param.name];
+      const value = param.in === "body" ? args.body : args[param.name];
 
       if (value === undefined || value === null) {
         continue;
@@ -147,63 +161,39 @@ export async function executeSwaggerTool(tool, args = {}) {
 
       if (param.in === "query") {
         queryParams[param.name] = value;
-      }
-
-      if (param.in === "header") {
+      } else if (param.in === "header") {
         headers[param.name] = value;
-      }
-
-      if (param.in === "body") {
+      } else if (param.in === "body") {
         body = value;
       }
     }
 
-    const url = BASE_URL + tool.path;
+    const request = {
+      method: tool.method,
+      url: BASE_URL + tool.path,
+      params: queryParams,
+      data: body,
+      headers
+    };
 
-    let response;
+    // Always ensure valid token
+    let token = await getAccessToken();
+    headers.Authorization = `Bearer ${token}`;
 
     try {
-      response = await axios({
-        method: tool.method,
-        url,
-        params: queryParams,
-        data: body,
-        headers,
-        httpsAgent,
-        maxBodyLength: Infinity
-      });
+      return (await http(request)).data;
     } catch (error) {
-
-      // Token expired / invalid → force refresh once
-      if (error.response?.status === 401) {
-
-        // Clear old token
-        cachedToken = null;
-        tokenExpiry = 0;
-
-        // Get fresh token
-        const newToken = await getAccessToken();
-
-        // Replace bearer token
-        headers.Authorization = `Bearer ${newToken}`;
-
-        // Retry original request once
-        response = await axios({
-          method: tool.method,
-          url,
-          params: queryParams,
-          data: body,
-          headers,
-          httpsAgent,
-          maxBodyLength: Infinity
-        });
-
-      } else {
+      if (error.response?.status !== 401) {
         throw error;
       }
-    }
-    return response.data;
 
+      // Token expired / invalid → force refresh and retry once
+      invalidateToken(token);
+      token = await getAccessToken();
+      headers.Authorization = `Bearer ${token}`;
+
+      return (await http(request)).data;
+    }
   } catch (error) {
     console.error(
       `[Swagger Execute Failed] ${tool?.method?.toUpperCase()} ${tool?.path}`,
